@@ -17,7 +17,7 @@ from . import __version__, config
 from .engine import Progress, ScanOptions, Scanner
 from .hashing import Cancellation
 from .model import ScanResult, automatic_selection
-from .operations import trash_selected
+from .operations import trash_selected, delete_selected
 
 LOG = logging.getLogger(__name__)
 
@@ -223,6 +223,10 @@ class MainWindow(Gtk.ApplicationWindow):
         self.stack = Gtk.Stack()
         switcher = Gtk.StackSwitcher(stack=self.stack)
         modes.pack_start(switcher, False, False, 0)
+        self.delete_button = Gtk.Button(label="Eliminar definitivamente…")
+        self.delete_button.get_style_context().add_class("destructive-action")
+        self.delete_button.connect("clicked", self.confirm_delete)
+        modes.pack_end(self.delete_button, False, False, 0)
         self.trash_button = Gtk.Button(label="Enviar selección a la papelera…")
         self.trash_button.connect("clicked", self.confirm_trash)
         modes.pack_end(self.trash_button, False, False, 0)
@@ -379,13 +383,14 @@ class MainWindow(Gtk.ApplicationWindow):
             elif kind == "removed":
                 self.result.remove(payload)
                 self.remove_row(payload)
-                self.update_summary("Enviando a la papelera…")
-            elif kind == "trash_done":
+                self.update_summary("Procesando archivos…")
+            elif kind in ("trash_done", "delete_done"):
                 self.result.errors.extend(payload.errors[:max(0, 500 - len(self.result.errors))])
                 self.result.error_count += len(payload.errors)
                 self.set_busy(False)
                 self.render_results()
-                self.update_summary(f"Operación {'cancelada' if payload.cancelled else 'completada'}: {len(payload.removed)} archivo(s) en la papelera")
+                destination = "eliminado(s) definitivamente" if kind == "delete_done" else "en la papelera"
+                self.update_summary(f"Operación {'cancelada' if payload.cancelled else 'completada'}: {len(payload.removed)} archivo(s) {destination}")
                 self.progress.set_text("Cancelado" if payload.cancelled else "Completado")
                 if payload.errors:
                     self.notice("Algunos grupos no se pudieron procesar", "\n".join(payload.errors[:15]), True)
@@ -544,6 +549,7 @@ class MainWindow(Gtk.ApplicationWindow):
             f"Examinados: {r.examined:,}   |   Grupos: {len(r.groups):,}   |   Copias redundantes: {r.redundant_count:,}\n"
             f"Recuperable al quitar copias: {human_size(r.potential_bytes)}   |   Selección: {len(r.selected):,} archivos · {human_size(r.selected_bytes)}")
         self.trash_button.set_sensitive(bool(r.selected) and not self.busy and not self.populating)
+        self.delete_button.set_sensitive(bool(r.selected) and not self.busy and not self.populating)
         self.error_button.set_sensitive(bool(r.error_count))
         self.auto_button.set_sensitive(bool(r.groups))
         self.clear_button.set_sensitive(bool(r.selected))
@@ -578,6 +584,34 @@ class MainWindow(Gtk.ApplicationWindow):
             self.events.put(("trash_done", report))
         self.launch(job)
         self.update_summary("Verificando contenido antes de enviar a la papelera…")
+
+    def confirm_delete(self, *_):
+        if self.busy or self.populating or not self.result.selected:
+            return
+        dialog = Gtk.MessageDialog(transient_for=self, modal=True, message_type=Gtk.MessageType.WARNING,
+                                   buttons=Gtk.ButtonsType.NONE, text="¿Está seguro?")
+        dialog.format_secondary_text(
+            f"Se eliminarán definitivamente {len(self.result.selected)} archivo(s) "
+            f"({human_size(self.result.selected_bytes)} estimados).\n\n"
+            "No pasarán por la papelera y no se podrán recuperar desde ella. "
+            "Se comprobará el contenido y se conservará al menos una copia por grupo.")
+        dialog.add_button("Cancelar", Gtk.ResponseType.CANCEL)
+        dialog.add_button("OK", Gtk.ResponseType.ACCEPT)
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+        response = dialog.run()
+        dialog.destroy()
+        if response != Gtk.ResponseType.ACCEPT:
+            return
+        snapshot = deepcopy(self.result)
+
+        def job():
+            report = delete_selected(snapshot, self.cancel_token,
+                                     on_removed=lambda path: self.events.put(("removed", path)),
+                                     on_progress=lambda done, total: self.post_progress(
+                                         Progress("Verificando y eliminando definitivamente", done, total, snapshot.examined)))
+            self.events.put(("delete_done", report))
+        self.launch(job)
+        self.update_summary("Verificando antes de eliminar definitivamente…")
 
     def selected_record(self, view):
         model, tree_iter = view.get_selection().get_selected()

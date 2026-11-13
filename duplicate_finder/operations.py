@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Trash only. No unlink, permanent deletion, or fallback deletion path."""
+"""Validated removal through either system trash or explicit permanent deletion."""
+import os
+import stat
 from dataclasses import dataclass, field
-from .hashing import Cancellation, Cancelled, FileChanged, current_stat, identical
+from .hashing import Cancellation, Cancelled, FileChanged, current_stat, identical, directory_fd
 
 
 @dataclass
@@ -17,7 +19,25 @@ def gio_trash(path):
         raise OSError("El sistema no pudo enviar el archivo a la papelera")
 
 
+def permanent_delete(record):
+    """Remove a verified regular file using a no-symlink parent descriptor."""
+    with directory_fd(record.path.parent) as parent:
+        current = os.stat(record.path.name, dir_fd=parent, follow_symlinks=False)
+        if not stat.S_ISREG(current.st_mode) or not record.matches(current):
+            raise FileChanged(f"Archivo modificado o sustituido: {record.path}")
+        os.unlink(record.path.name, dir_fd=parent)
+
+
 def trash_selected(result, cancel=None, trash=None, on_removed=None, on_progress=None):
+    action = trash or gio_trash
+    return _remove_selected(result, cancel, lambda record: action(record.path), on_removed, on_progress)
+
+
+def delete_selected(result, cancel=None, delete=None, on_removed=None, on_progress=None):
+    return _remove_selected(result, cancel, delete or permanent_delete, on_removed, on_progress)
+
+
+def _remove_selected(result, cancel, remove, on_removed, on_progress):
     """Runs on a worker. Does not mutate the UI result model.
 
     Validate every member before starting a group. Before each trash, recheck
@@ -25,7 +45,6 @@ def trash_selected(result, cancel=None, trash=None, on_removed=None, on_progress
     A failure stops that group; other independent groups can still proceed.
     """
     cancel = cancel or Cancellation()
-    trash = trash or gio_trash
     on_removed = on_removed or (lambda path: None)
     on_progress = on_progress or (lambda done, total: None)
     report = TrashReport()
@@ -58,11 +77,11 @@ def trash_selected(result, cancel=None, trash=None, on_removed=None, on_progress
                         current_stat(record)
                     if not identical(keeper, target, cancel):
                         raise FileChanged(f"El contenido ya no coincide: {target.path}")
-                    # Final path checks immediately adjacent to the GIO call.
+                    # Final path checks immediately adjacent to the removal call.
                     current_stat(keeper)
                     current_stat(target)
                     cancel.check()
-                    trash(target.path)
+                    remove(target)
                     remaining.remove(target)
                     report.removed.append(target.path)
                     on_removed(target.path)
