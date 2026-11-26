@@ -7,6 +7,7 @@ import logging
 import os
 import queue
 import threading
+import time
 
 import gi
 gi.require_version("Gtk", "3.0")
@@ -112,7 +113,9 @@ class MainWindow(Gtk.ApplicationWindow):
         self.result = ScanResult()
         self.records = {}
         self.path_ids = {}
-        self.row_refs = {}
+        self.row_iters = {}
+        self.group_counts = {}
+        self.removed_paths = set()
         self.events = queue.Queue()
         self.progress_lock = threading.Lock()
         self.latest_progress = None
@@ -367,7 +370,8 @@ class MainWindow(Gtk.ApplicationWindow):
             self.current_path.set_text(display_path(progress.path))
             if progress.stage == "Inventario":
                 self.summary.set_text(f"Archivos examinados: {progress.examined:,}")
-        for _ in range(200):
+        deadline = time.monotonic() + 0.008
+        while time.monotonic() < deadline:
             try:
                 kind, payload = self.events.get_nowait()
             except queue.Empty:
@@ -381,36 +385,49 @@ class MainWindow(Gtk.ApplicationWindow):
                 self.current_path.set_text("")
                 self.update_summary("Análisis cancelado" if payload.cancelled else "Análisis completado")
             elif kind == "removed":
-                self.result.remove(payload)
+                self.removed_paths.add(payload)
                 self.remove_row(payload)
-                self.update_summary("Procesando archivos…")
             elif kind in ("trash_done", "delete_done"):
                 self.result.errors.extend(payload.errors[:max(0, 500 - len(self.result.errors))])
                 self.result.error_count += len(payload.errors)
-                self.set_busy(False)
-                self.render_results()
+                self.finish_removal()
                 destination = "eliminado(s) definitivamente" if kind == "delete_done" else "en la papelera"
                 self.update_summary(f"Operación {'cancelada' if payload.cancelled else 'completada'}: {len(payload.removed)} archivo(s) {destination}")
                 self.progress.set_text("Cancelado" if payload.cancelled else "Completado")
+                if not payload.cancelled and not payload.errors:
+                    self.progress.set_fraction(1)
                 if payload.errors:
                     self.notice("Algunos grupos no se pudieron procesar", "\n".join(payload.errors[:15]), True)
             elif kind == "failure":
-                self.set_busy(False)
+                self.finish_removal()
                 self.progress.set_text("Error")
                 self.update_summary("Operación interrumpida")
                 self.notice("No se pudo completar la operación", payload, True)
+        if self.removed_paths:
+            self.summary.set_text(f"Archivos retirados de la selección: {len(self.removed_paths):,} de {len(self.result.selected):,}")
         if self.closing and not self.busy and not self.populating:
             self.persist()
             self.destroy()
             return False
         return True
 
+    def finish_removal(self):
+        # The worker has finished reading the model. Reconcile once, including
+        # successful removals before an error or cancellation.
+        self.result.remove_many(self.removed_paths)
+        self.removed_paths.clear()
+        with self.progress_lock:
+            self.latest_progress = None
+        self.current_path.set_text("")
+        self.set_busy(False)
+
     def clear_models(self):
         self.tree_store.clear()
         self.table_store.clear()
         self.records.clear()
         self.path_ids.clear()
-        self.row_refs.clear()
+        self.row_iters.clear()
+        self.group_counts.clear()
 
     def render_results(self):
         self.clear_models()
@@ -422,6 +439,7 @@ class MainWindow(Gtk.ApplicationWindow):
     def result_rows(self):
         row_id = 0
         for group in self.result.groups:
+            self.group_counts[group.id] = len(group.files)
             parent = self.tree_store.append(None, [False, f"Grupo {group.id} — {len(group.files)} archivos",
                                                   "", group.files[0].size, 0, group.id, 0, False, group.digest])
             for record in group.files:
@@ -436,9 +454,8 @@ class MainWindow(Gtk.ApplicationWindow):
                        group.id, row_id, True, tooltip]
                 ti = self.tree_store.append(parent, row)
                 li = self.table_store.append(row)
-                self.row_refs[row_id] = (
-                    Gtk.TreeRowReference.new(self.tree_store, self.tree_store.get_path(ti)),
-                    Gtk.TreeRowReference.new(self.table_store, self.table_store.get_path(li)))
+                # Both GTK stores keep iterators valid across sorts and sibling removals.
+                self.row_iters[row_id] = (ti, li)
                 yield
 
     def render_chunk(self):
@@ -455,43 +472,35 @@ class MainWindow(Gtk.ApplicationWindow):
         return True
 
     def remove_row(self, path):
-        row_id = self.path_ids.get(path)
-        if row_id is None:
-            return
-        for store, ref in zip((self.tree_store, self.table_store), self.row_refs.get(row_id, ())):
-            if ref.valid():
-                store.remove(store.get_iter(ref.get_path()))
-        self.records.pop(row_id, None)
-        self.row_refs.pop(row_id, None)
-        self.path_ids.pop(path, None)
-        # Remove now-singleton groups from the displayed duplicate results.
-        active = {f.path for g in self.result.groups for f in g.files}
-        for candidate in list(self.path_ids):
-            if candidate not in active:
-                rid = self.path_ids.pop(candidate)
-                for store, ref in zip((self.tree_store, self.table_store), self.row_refs.pop(rid, ())):
-                    if ref.valid():
-                        store.remove(store.get_iter(ref.get_path()))
-                self.records.pop(rid, None)
-        node = self.tree_store.get_iter_first()
-        while node is not None:
-            following = self.tree_store.iter_next(node)
-            count = self.tree_store.iter_n_children(node)
-            if count == 0:
-                self.tree_store.remove(node)
-            else:
-                self.tree_store.set_value(node, 1, f"Grupo {self.tree_store.get_value(node, 5)} — {count} archivos")
-            node = following
+        row_id = self.path_ids[path]
+        tree_iter, _ = self.row_iters[row_id]
+        parent = self.tree_store.iter_parent(tree_iter)
+        group_id = self.tree_store.get_value(parent, 5)
+        self.discard_display_row(row_id)
+        count = self.group_counts[group_id] - 1
+        if count == 1:
+            last = self.tree_store.iter_children(parent)
+            self.discard_display_row(self.tree_store.get_value(last, 6))
+            self.tree_store.remove(parent)
+            del self.group_counts[group_id]
+        else:
+            self.group_counts[group_id] = count
+            self.tree_store.set_value(parent, 1, f"Grupo {group_id} — {count} archivos")
+
+    def discard_display_row(self, row_id):
+        tree_iter, table_iter = self.row_iters.pop(row_id)
+        self.tree_store.remove(tree_iter)
+        self.table_store.remove(table_iter)
+        del self.path_ids[self.records.pop(row_id).path]
 
     def sync_selection(self, paths=None):
-        ids = list(self.row_refs) if paths is None else [self.path_ids[p] for p in paths if p in self.path_ids]
+        ids = list(self.row_iters) if paths is None else [self.path_ids[p] for p in paths if p in self.path_ids]
 
         def rows():
             for row_id in ids:
                 record = self.records[row_id]
-                for store, ref in zip((self.tree_store, self.table_store), self.row_refs[row_id]):
-                    if ref.valid():
-                        store.set_value(store.get_iter(ref.get_path()), 0, record.path in self.result.selected)
+                for store, tree_iter in zip((self.tree_store, self.table_store), self.row_iters[row_id]):
+                    store.set_value(tree_iter, 0, record.path in self.result.selected)
                 yield
 
         iterator = rows()
@@ -573,17 +582,7 @@ class MainWindow(Gtk.ApplicationWindow):
         dialog.destroy()
         if response != Gtk.ResponseType.ACCEPT:
             return
-        # The worker gets independent lists and selection, never a mutable UI model.
-        snapshot = deepcopy(self.result)
-
-        def job():
-            report = trash_selected(snapshot, self.cancel_token,
-                                    on_removed=lambda path: self.events.put(("removed", path)),
-                                    on_progress=lambda done, total: self.post_progress(
-                                        Progress("Verificando y enviando a la papelera", done, total, snapshot.examined)))
-            self.events.put(("trash_done", report))
-        self.launch(job)
-        self.update_summary("Verificando contenido antes de enviar a la papelera…")
+        self.start_removal(trash_selected, "trash_done", "Enviando a la papelera")
 
     def confirm_delete(self, *_):
         if self.busy or self.populating or not self.result.selected:
@@ -602,16 +601,28 @@ class MainWindow(Gtk.ApplicationWindow):
         dialog.destroy()
         if response != Gtk.ResponseType.ACCEPT:
             return
-        snapshot = deepcopy(self.result)
+        self.start_removal(delete_selected, "delete_done", "Eliminando definitivamente")
+
+    def start_removal(self, operation, done_event, stage):
+        # Selection is locked while busy. Only the GTK rows change until the
+        # worker posts its final event, so it can read this model directly.
+        result = self.result
+        self.progress.set_fraction(0)
+        self.progress.set_text("Verificando la selección…")
+        self.status.set_text(stage + "…")
+
+        def verifying(group_id, index, count, path):
+            self.post_progress(Progress(f"Verificando grupo {group_id} · {index:,} de {count:,}",
+                                        index - 1, count, result.examined, str(path)))
 
         def job():
-            report = delete_selected(snapshot, self.cancel_token,
-                                     on_removed=lambda path: self.events.put(("removed", path)),
-                                     on_progress=lambda done, total: self.post_progress(
-                                         Progress("Verificando y eliminando definitivamente", done, total, snapshot.examined)))
-            self.events.put(("delete_done", report))
+            report = operation(result, self.cancel_token,
+                               on_removed=lambda path: self.events.put(("removed", path)),
+                               on_progress=lambda done, total: self.post_progress(
+                                   Progress(f"{stage} · {done:,} de {total:,}", done, total, result.examined)),
+                               on_verifying=verifying)
+            self.events.put((done_event, report))
         self.launch(job)
-        self.update_summary("Verificando antes de eliminar definitivamente…")
 
     def selected_record(self, view):
         model, tree_iter = view.get_selection().get_selected()

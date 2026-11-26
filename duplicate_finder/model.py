@@ -79,17 +79,19 @@ class ScanResult:
         return False
 
     def remove(self, path):
-        path = Path(path)
-        self.selected.discard(path)
-        for group in self.groups:
-            group.files[:] = [f for f in group.files if f.path != path]
+        self.remove_many({Path(path)})
+
+    def remove_many(self, removed):
+        if not removed:
+            return
+        self.selected.difference_update(removed)
         surviving = []
         for group in self.groups:
+            group.files[:] = [f for f in group.files if f.path not in removed]
             if len(group.files) > 1:
                 surviving.append(group)
             else:
-                for f in group.files:
-                    self.selected.discard(f.path)
+                self.selected.difference_update(f.path for f in group.files)
         self.groups[:] = surviving
 
 

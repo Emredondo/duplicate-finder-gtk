@@ -28,16 +28,16 @@ def permanent_delete(record):
         os.unlink(record.path.name, dir_fd=parent)
 
 
-def trash_selected(result, cancel=None, trash=None, on_removed=None, on_progress=None):
+def trash_selected(result, cancel=None, trash=None, on_removed=None, on_progress=None, on_verifying=None):
     action = trash or gio_trash
-    return _remove_selected(result, cancel, lambda record: action(record.path), on_removed, on_progress)
+    return _remove_selected(result, cancel, lambda record: action(record.path), on_removed, on_progress, on_verifying)
 
 
-def delete_selected(result, cancel=None, delete=None, on_removed=None, on_progress=None):
-    return _remove_selected(result, cancel, delete or permanent_delete, on_removed, on_progress)
+def delete_selected(result, cancel=None, delete=None, on_removed=None, on_progress=None, on_verifying=None):
+    return _remove_selected(result, cancel, delete or permanent_delete, on_removed, on_progress, on_verifying)
 
 
-def _remove_selected(result, cancel, remove, on_removed, on_progress):
+def _remove_selected(result, cancel, remove, on_removed, on_progress, on_verifying):
     """Runs on a worker. Does not mutate the UI result model.
 
     Validate every member before starting a group. Before each trash, recheck
@@ -64,8 +64,10 @@ def _remove_selected(result, cancel, remove, on_removed, on_progress):
             keeper = keepers[0]
             remaining = list(group.files)
             try:
-                for record in remaining:
+                for index, record in enumerate(remaining, 1):
                     cancel.check()
+                    if on_verifying:
+                        on_verifying(group.id, index, len(remaining), record.path)
                     current_stat(record)
                     if record != keeper and not identical(keeper, record, cancel):
                         raise FileChanged(f"El contenido ya no coincide: {record.path}")
